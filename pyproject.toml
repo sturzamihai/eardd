@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Evaluating the Adversarial Robustness of Deepfake Detectors"
 authors = ["Mihai Sturza <mihai.sturza@nevexo.tech>"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12,<3.14.1"
