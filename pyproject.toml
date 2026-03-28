@@ -6,7 +6,7 @@ authors = ["Mihai Sturza <mihai.sturza@nevexo.tech>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.13,<3.14.1"
+python = "^3.12,<3.14.1"
 torch = "^2.11.0"
 torchvision = "^0.26.0"
 torchattacks = "^3.5.1"
