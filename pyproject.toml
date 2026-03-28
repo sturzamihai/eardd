@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "eardd"
+version = "0.1.0"
+description = "Evaluating the Adversarial Robustness of Deepfake Detectors"
+authors = ["Mihai Sturza <mihai.sturza@nevexo.tech>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.13,<3.14.1"
+torch = "^2.11.0"
+torchvision = "^0.26.0"
+torchattacks = "^3.5.1"
+efficientnet-pytorch = "^0.7.1"
+timm = "^1.0.26"
+scikit-learn = "^1.8.0"
+opencv-python = "^4.13.0.92"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
