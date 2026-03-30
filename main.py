@@ -14,7 +14,9 @@ Usage:
     --device         auto \\
     --models         xception effnetb4 ucf recce \\
     --batch-size     16 \\
-    --cw-steps       200
+    --cw-steps       200 \\
+    --cw-samples     1000 \\   # cap C&W at 1000 frames (expensive)
+    --square-samples 1000      # cap Square Attack at 1000 frames (very expensive)
 """
 
 import argparse
@@ -152,6 +154,18 @@ def parse_args():
         default=200,
         help="C&W optimisation steps (use 1000 for final results)",
     )
+    p.add_argument(
+        "--cw-samples",
+        type=int,
+        default=None,
+        help="Max frames to evaluate for C&W (default: full dataset)",
+    )
+    p.add_argument(
+        "--square-samples",
+        type=int,
+        default=None,
+        help="Max frames to evaluate for Square Attack (default: full dataset)",
+    )
     return p.parse_args()
 
 
@@ -163,14 +177,21 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     dataset = CelebDFv2Dataset(args.data_dir)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
     print(f"Dataset: {len(dataset)} frames")
+
+    def make_loader(max_samples: int | None) -> DataLoader:
+        ds = dataset
+        if max_samples is not None and max_samples < len(dataset):
+            ds = torch.utils.data.Subset(dataset, range(max_samples))
+        return DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+    loader = make_loader(None)
 
     models: dict[str, nn.Module] = {}
     for name in args.models:
@@ -192,47 +213,56 @@ def main():
         baseline_rows.append({"model": name, "ACC": acc, "AUC": auc})
     print_table(baseline_rows, "Baseline (clean)")
 
+    cw_loader = make_loader(args.cw_samples)
+    if args.cw_samples is not None and args.cw_samples < len(dataset):
+        print(f"C&W capped at {args.cw_samples} frames")
+
     wb_rows = []
     for name, model in models.items():
         labels = baseline_results[name]["labels"]
         clean_preds = baseline_results[name]["preds"]
 
-        attacks = [
+        cheap_attacks = [
             ("FGSM-2", torchattacks.FGSM(model, eps=2 / 255)),
             ("FGSM-4", torchattacks.FGSM(model, eps=4 / 255)),
             ("FGSM-8", torchattacks.FGSM(model, eps=8 / 255)),
             ("PGD-50", torchattacks.PGD(model, eps=8 / 255, alpha=2 / 255, steps=50)),
-            ("CW-L2", torchattacks.CW(model, c=1.0, steps=args.cw_steps)),
         ]
 
-        for atk_name, attack in attacks:
+        for atk_name, attack in cheap_attacks:
             print(f"  {name} / {atk_name} ...", end=" ", flush=True)
             adv_logits, cp, _ = evaluate_on_adversarial(model, attack, loader, device)
             acc, auc = compute_metrics(adv_logits, labels)
             asr = attack_success_rate(cp.numpy(), adv_logits.argmax(1).numpy())
-            wb_rows.append(
-                {
-                    "model": name,
-                    "attack": atk_name,
-                    "ACC": acc,
-                    "AUC": auc,
-                    "ASR": asr,
-                }
-            )
+            wb_rows.append({"model": name, "attack": atk_name, "ACC": acc, "AUC": auc, "ASR": asr})
             print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
+
+        print(f"  {name} / CW-L2 ...", end=" ", flush=True)
+        cw_attack = torchattacks.CW(model, c=1.0, steps=args.cw_steps)
+        cw_logits, _, cw_labels = evaluate_on_adversarial(model, cw_attack, cw_loader, device)
+        cw_clean_preds = clean_preds[: len(cw_labels)]
+        acc, auc = compute_metrics(cw_logits, cw_labels)
+        asr = attack_success_rate(cw_clean_preds, cw_logits.argmax(1).numpy())
+        wb_rows.append({"model": name, "attack": "CW-L2", "ACC": acc, "AUC": auc, "ASR": asr})
+        print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
 
     print_table(wb_rows, "White-box attacks")
 
+    square_loader = make_loader(args.square_samples)
+    if args.square_samples is not None and args.square_samples < len(dataset):
+        print(f"Square Attack capped at {args.square_samples} frames")
+
     bb_rows = []
     for name, model in models.items():
-        labels = baseline_results[name]["labels"]
+        clean_preds = baseline_results[name]["preds"]
         print(f"  {name} / Square ...", end=" ", flush=True)
         attack = torchattacks.Square(
             model, norm="Linf", eps=8 / 255, n_queries=5000, p_init=0.05
         )
-        adv_logits, cp, _ = evaluate_on_adversarial(model, attack, loader, device)
-        acc, auc = compute_metrics(adv_logits, labels)
-        asr = attack_success_rate(cp.numpy(), adv_logits.argmax(1).numpy())
+        adv_logits, _, sq_labels = evaluate_on_adversarial(model, attack, square_loader, device)
+        sq_clean_preds = clean_preds[: len(sq_labels)]
+        acc, auc = compute_metrics(adv_logits, sq_labels)
+        asr = attack_success_rate(sq_clean_preds, adv_logits.argmax(1).numpy())
         bb_rows.append({"model": name, "ACC": acc, "AUC": auc, "ASR": asr})
         print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
 
