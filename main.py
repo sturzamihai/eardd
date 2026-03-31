@@ -2,21 +2,24 @@
 Adversarial robustness benchmark for deepfake detectors on Celeb-DF v2.
 
 Attacks:
-  White-box : FGSM (ε=0.5,1,2/255)  |  PGD-50 (ε=8/255)  |  C&W L2
+  White-box : FGSM (ε=0.05,0.1,2,8/255)  |  PGD-50 (ε=8/255)  |  C&W L2
   Black-box  : Square Attack (ε=8/255)
   Transfer   : PGD-50 adversarial examples from each source model
-               evaluated on all target models → 4x4 ASR matrix
+               evaluated on all target models → 4x4 ASR and video-AUC matrices
+
+Metrics per attack: ACC (overall / real / fake), AUC (frame + video), ASR,
+                    L2, PSNR, SSIM, LPIPS
 
 Usage:
   python main.py \\
-    --checkpoint-dir /path/to/pretrained \\
+    --checkpoint-dir models/weights \\
     --data-dir       data/Celeb-DF-v2 \\
     --device         auto \\
     --models         xception effnetb4 ucf recce \\
     --batch-size     16 \\
     --cw-steps       200 \\
-    --cw-samples     1000 \\   # cap C&W at 1000 frames (expensive)
-    --square-samples 1000      # cap Square Attack at 1000 frames (very expensive)
+    --cw-samples     1000 \\
+    --square-samples 1000
 """
 
 import argparse
@@ -25,14 +28,20 @@ import os
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
+import lpips
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 import torchattacks
 
 from dataset import CelebDFv2Dataset
+from evaluation import evaluate, evaluate_on_adversarial
+from metrics import (
+    attack_success_rate,
+    class_acc,
+    compute_metrics,
+    video_level_auc,
+)
 from models import MODELS
 
 
@@ -70,71 +79,6 @@ CHECKPOINT_NAMES = {
     "ucf": "ucf_best.pth",
     "recce": "recce_best.pth",
 }
-
-
-def compute_metrics(logits: torch.Tensor, labels: torch.Tensor):
-    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-    preds = logits.argmax(dim=1).cpu().numpy()
-    lbls = labels.cpu().numpy()
-    acc = (preds == lbls).mean()
-    try:
-        auc = roc_auc_score(lbls, probs)
-    except ValueError:
-        auc = float("nan")
-    return acc, auc
-
-
-def attack_success_rate(
-    clean_preds: np.ndarray,
-    adv_preds: np.ndarray,
-    labels: np.ndarray,
-) -> float:
-    mask = (labels == 1) & (clean_preds == 1)
-    if mask.sum() == 0:
-        return float("nan")
-    return float((adv_preds[mask] == 0).mean())
-
-
-@torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device):
-    all_logits, all_labels = [], []
-    for images, labels, _ in loader:
-        images = images.to(device)
-        logits = model(images)
-        all_logits.append(logits.cpu())
-        all_labels.append(labels)
-    return torch.cat(all_logits), torch.cat(all_labels)
-
-
-def evaluate_on_adversarial(
-    model: nn.Module,
-    attack,
-    loader: DataLoader,
-    device: torch.device,
-):
-    adv_logits_list, clean_preds_list, labels_list = [], [], []
-    model.eval()
-    for images, labels, _ in loader:
-        images = images.to(device)
-        labels_d = labels.to(device)
-
-        # Start from clean; overwrite only the fake rows
-        adv_images = images.clone()
-        fake_mask = labels_d == 1
-        if fake_mask.any():
-            adv_images[fake_mask] = attack(images[fake_mask], labels_d[fake_mask])
-
-        with torch.no_grad():
-            logits_clean = model(images)
-            logits_adv = model(adv_images)
-        clean_preds_list.append(logits_clean.argmax(1).cpu())
-        adv_logits_list.append(logits_adv.cpu())
-        labels_list.append(labels)
-    return (
-        torch.cat(adv_logits_list),
-        torch.cat(clean_preds_list),
-        torch.cat(labels_list),
-    )
 
 
 def fmt(val) -> str:
@@ -200,6 +144,35 @@ def parse_args():
     return p.parse_args()
 
 
+def _attack_row(
+    name: str,
+    atk_name: str,
+    adv_logits: torch.Tensor,
+    cp: torch.Tensor,
+    adv_labels: torch.Tensor,
+    vid_ids: list[str],
+    perturb: dict[str, float],
+) -> dict:
+    preds = adv_logits.argmax(1).numpy()
+    acc, auc = compute_metrics(adv_logits, adv_labels)
+    r_acc, f_acc = class_acc(preds, adv_labels.numpy())
+    v_auc = video_level_auc(
+        torch.softmax(adv_logits, 1)[:, 1].numpy(), adv_labels.numpy(), vid_ids
+    )
+    asr = attack_success_rate(cp.numpy(), preds, adv_labels.numpy())
+    return {
+        "model": name,
+        "attack": atk_name,
+        "ACC": acc,
+        "real_ACC": r_acc,
+        "fake_ACC": f_acc,
+        "AUC": auc,
+        "video_AUC": v_auc,
+        "ASR": asr,
+        **perturb,
+    }
+
+
 def main():
     args = parse_args()
     device = get_device(args.device)
@@ -231,17 +204,35 @@ def main():
         models[name] = MODELS[name](str(ckpt_path), device=str(device))
         print("ok")
 
+    print("Loading LPIPS (AlexNet) ...", end=" ", flush=True)
+    lpips_fn = lpips.LPIPS(net="alex").to(device)
+    print("ok")
+
     baseline_rows = []
     baseline_results: dict[str, dict] = {}
     for name, model in models.items():
-        logits, labels = evaluate(model, loader, device)
+        logits, labels, video_ids = evaluate(model, loader, device)
         acc, auc = compute_metrics(logits, labels)
+        preds = logits.argmax(1).numpy()
+        probs = torch.softmax(logits, dim=1)[:, 1].numpy()
+        r_acc, f_acc = class_acc(preds, labels.numpy())
+        v_auc = video_level_auc(probs, labels.numpy(), video_ids)
         baseline_results[name] = {
             "logits": logits,
             "labels": labels,
-            "preds": logits.argmax(1).numpy(),
+            "preds": preds,
+            "video_ids": video_ids,
         }
-        baseline_rows.append({"model": name, "ACC": acc, "AUC": auc})
+        baseline_rows.append(
+            {
+                "model": name,
+                "ACC": acc,
+                "real_ACC": r_acc,
+                "fake_ACC": f_acc,
+                "AUC": auc,
+                "video_AUC": v_auc,
+            }
+        )
     print_table(baseline_rows, "Baseline (clean)")
 
     cw_loader = make_loader(args.cw_samples)
@@ -250,15 +241,12 @@ def main():
 
     wb_rows = []
     for name, model in models.items():
-        labels = baseline_results[name]["labels"]
-
         cheap_attacks = [
             ("Random-0.1", RandomNoise(eps=0.1 / 255)),
+            ("FGSM-0.05", make_attack(torchattacks.FGSM(model, eps=0.05 / 255))),
             ("FGSM-0.1", make_attack(torchattacks.FGSM(model, eps=0.1 / 255))),
-            ("FGSM-0.25", make_attack(torchattacks.FGSM(model, eps=0.25 / 255))),
-            ("FGSM-0.5", make_attack(torchattacks.FGSM(model, eps=0.5 / 255))),
-            ("FGSM-1", make_attack(torchattacks.FGSM(model, eps=1 / 255))),
             ("FGSM-2", make_attack(torchattacks.FGSM(model, eps=2 / 255))),
+            ("FGSM-8", make_attack(torchattacks.FGSM(model, eps=8 / 255))),
             (
                 "PGD-50",
                 make_attack(
@@ -269,31 +257,31 @@ def main():
 
         for atk_name, attack in cheap_attacks:
             print(f"  {name} / {atk_name} ...", end=" ", flush=True)
-            adv_logits, cp, adv_labels = evaluate_on_adversarial(
-                model, attack, loader, device
+            adv_logits, cp, adv_labels, vid_ids, perturb = evaluate_on_adversarial(
+                model, attack, loader, device, lpips_fn
             )
-            acc, auc = compute_metrics(adv_logits, adv_labels)
-            asr = attack_success_rate(
-                cp.numpy(), adv_logits.argmax(1).numpy(), adv_labels.numpy()
+            row = _attack_row(
+                name, atk_name, adv_logits, cp, adv_labels, vid_ids, perturb
             )
-            wb_rows.append(
-                {"model": name, "attack": atk_name, "ACC": acc, "AUC": auc, "ASR": asr}
+            wb_rows.append(row)
+            print(
+                f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
+                f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
             )
-            print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
 
         print(f"  {name} / CW-L2 ...", end=" ", flush=True)
         cw_attack = make_attack(torchattacks.CW(model, c=1.0, steps=args.cw_steps))
-        cw_logits, cw_clean_preds, cw_labels = evaluate_on_adversarial(
-            model, cw_attack, cw_loader, device
+        cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb = evaluate_on_adversarial(
+            model, cw_attack, cw_loader, device, lpips_fn
         )
-        acc, auc = compute_metrics(cw_logits, cw_labels)
-        asr = attack_success_rate(
-            cw_clean_preds.numpy(), cw_logits.argmax(1).numpy(), cw_labels.numpy()
+        row = _attack_row(
+            name, "CW-L2", cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb
         )
-        wb_rows.append(
-            {"model": name, "attack": "CW-L2", "ACC": acc, "AUC": auc, "ASR": asr}
+        wb_rows.append(row)
+        print(
+            f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
+            f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
         )
-        print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
 
     print_table(wb_rows, "White-box attacks")
 
@@ -304,25 +292,28 @@ def main():
     bb_rows = []
     for name, model in models.items():
         print(f"  {name} / Square ...", end=" ", flush=True)
-        attack = make_attack(
+        sq_attack = make_attack(
             torchattacks.Square(
                 model, norm="Linf", eps=8 / 255, n_queries=5000, p_init=0.05
             )
         )
-        adv_logits, sq_clean_preds, sq_labels = evaluate_on_adversarial(
-            model, attack, square_loader, device
+        adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb = evaluate_on_adversarial(
+            model, sq_attack, square_loader, device, lpips_fn
         )
-        acc, auc = compute_metrics(adv_logits, sq_labels)
-        asr = attack_success_rate(
-            sq_clean_preds.numpy(), adv_logits.argmax(1).numpy(), sq_labels.numpy()
+        row = _attack_row(
+            name, "Square", adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb
         )
-        bb_rows.append({"model": name, "ACC": acc, "AUC": auc, "ASR": asr})
-        print(f"ACC={acc:.4f}  AUC={auc:.4f}  ASR={asr:.4f}")
+        bb_rows.append(row)
+        print(
+            f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
+            f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
+        )
 
     print_table(bb_rows, "Black-box: Square Attack (ε=8/255)")
 
     print("\nBuilding transfer adversarial examples (PGD-50) ...")
     transfer_asr: dict[str, dict[str, float]] = defaultdict(dict)
+    transfer_v_auc: dict[str, dict[str, float]] = defaultdict(dict)
 
     for src_name, src_model in models.items():
         print(f"  Generating from {src_name} ...", end=" ", flush=True)
@@ -348,24 +339,32 @@ def main():
             adv_logits_list = []
             for adv_batch in adv_batches:
                 with torch.no_grad():
-                    logits_adv = tgt_model(adv_batch.to(device))
-                adv_logits_list.append(logits_adv.cpu())
+                    adv_logits_list.append(tgt_model(adv_batch.to(device)).cpu())
             adv_logits_all = torch.cat(adv_logits_list)
             tgt_clean_preds = baseline_results[tgt_name]["preds"]
+            tgt_vid_ids = baseline_results[tgt_name]["video_ids"]
             asr = attack_success_rate(
                 tgt_clean_preds, adv_logits_all.argmax(1).numpy(), all_labels
             )
+            v_auc = video_level_auc(
+                torch.softmax(adv_logits_all, 1)[:, 1].numpy(), all_labels, tgt_vid_ids
+            )
             transfer_asr[src_name][tgt_name] = asr
+            transfer_v_auc[src_name][tgt_name] = v_auc
 
     model_names = list(models.keys())
-    print(f'\n{"─" * 70}')
-    print("  Transfer ASR matrix  (rows=source, cols=target)")
-    print(f'{"─" * 70}')
-    header = "         " + "  ".join(f"{n:>10}" for n in model_names)
-    print(header)
-    for src in model_names:
-        row_vals = "  ".join(f"{transfer_asr[src][tgt]:>10.4f}" for tgt in model_names)
-        print(f"{src:<9}{row_vals}")
+
+    def _print_matrix(matrix: dict[str, dict[str, float]], title: str):
+        print(f'\n{"─" * 70}')
+        print(f"  {title}  (rows=source, cols=target)")
+        print(f'{"─" * 70}')
+        print("         " + "  ".join(f"{n:>10}" for n in model_names))
+        for src in model_names:
+            vals = "  ".join(f"{matrix[src][tgt]:>10.4f}" for tgt in model_names)
+            print(f"{src:<9}{vals}")
+
+    _print_matrix(transfer_asr, "Transfer ASR matrix")
+    _print_matrix(transfer_v_auc, "Transfer video-AUC matrix")
 
     out_dir = Path(args.output_dir)
 
@@ -383,15 +382,19 @@ def main():
     write_csv(wb_rows, "whitebox.csv")
     write_csv(bb_rows, "blackbox_square.csv")
 
-    transfer_path = out_dir / "transfer_matrix.csv"
-    with open(transfer_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["source"] + model_names)
-        for src in model_names:
-            writer.writerow(
-                [src] + [f"{transfer_asr[src][tgt]:.4f}" for tgt in model_names]
-            )
-    print(f"Saved {transfer_path}")
+    for matrix, filename in [
+        (transfer_asr, "transfer_asr.csv"),
+        (transfer_v_auc, "transfer_video_auc.csv"),
+    ]:
+        path = out_dir / filename
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["source"] + model_names)
+            for src in model_names:
+                writer.writerow(
+                    [src] + [f"{matrix[src][tgt]:.4f}" for tgt in model_names]
+                )
+        print(f"Saved {path}")
 
 
 if __name__ == "__main__":
