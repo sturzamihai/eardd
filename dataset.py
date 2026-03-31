@@ -24,7 +24,7 @@ _STD = (0.5, 0.5, 0.5)
 
 def _normalize(img: np.ndarray) -> torch.Tensor:
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_LINEAR)
+    img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_CUBIC)
     x = img.astype(np.float32) / 255.0
     x = (x - _MEAN) / _STD
     return torch.from_numpy(x).permute(2, 0, 1).float()
