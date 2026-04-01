@@ -12,14 +12,15 @@ Metrics per attack: ACC (overall / real / fake), AUC (frame + video), ASR,
 
 Usage:
   python main.py \\
-    --checkpoint-dir models/weights \\
-    --data-dir       data/Celeb-DF-v2 \\
-    --device         auto \\
-    --models         xception effnetb4 ucf recce \\
-    --batch-size     16 \\
-    --cw-steps       200 \\
-    --cw-samples     1000 \\
-    --square-samples 1000
+    --checkpoint-dir    models/weights \\
+    --data-dir          data/Celeb-DF-v2 \\
+    --device            auto \\
+    --models            xception effnetb4 ucf recce \\
+    --attack            baseline whitebox cw square transfer
+    --batch-size        16 \\
+    --cw-steps          200 \\
+    --cw-samples        1000 \\
+    --square-samples    1000
 """
 
 import argparse
@@ -141,6 +142,13 @@ def parse_args():
         default=None,
         help="Max frames to evaluate for Square Attack (default: full dataset)",
     )
+    p.add_argument(
+        "--attacks",
+        nargs="+",
+        default=["baseline", "whitebox", "cw", "square", "transfer"],
+        choices=["baseline", "whitebox", "cw", "square", "transfer"],
+        help="Attack groups to run (default: all)",
+    )
     return p.parse_args()
 
 
@@ -186,7 +194,18 @@ def main():
     def make_loader(max_samples: int | None) -> DataLoader:
         ds = dataset
         if max_samples is not None and max_samples < len(dataset):
-            ds = torch.utils.data.Subset(dataset, range(max_samples))
+            real_idx = [i for i, (_, lbl, _) in enumerate(dataset.samples) if lbl == 0]
+            fake_idx = [i for i, (_, lbl, _) in enumerate(dataset.samples) if lbl == 1]
+            n_fake = max_samples // 2
+            n_real = max_samples - n_fake
+            n_real = min(n_real, len(real_idx))
+            n_fake = min(n_fake, len(fake_idx))
+            indices = real_idx[:n_real] + fake_idx[:n_fake]
+            indices.sort()
+            ds = torch.utils.data.Subset(dataset, indices)
+            print(
+                f"  Stratified subset: {n_real} real + {n_fake} fake = {len(indices)} frames"
+            )
         return DataLoader(
             ds,
             batch_size=args.batch_size,
@@ -194,6 +213,8 @@ def main():
             num_workers=args.num_workers,
             pin_memory=(device.type == "cuda"),
         )
+
+    run = set(args.attacks)
 
     loader = make_loader(None)
 
@@ -204,64 +225,83 @@ def main():
         models[name] = MODELS[name](str(ckpt_path), device=str(device))
         print("ok")
 
-    print("Loading LPIPS (AlexNet) ...", end=" ", flush=True)
-    lpips_fn = lpips.LPIPS(net="alex").to(device)
-    print("ok")
+    if run & {"whitebox", "cw", "square"}:
+        print("Loading LPIPS (AlexNet) ...", end=" ", flush=True)
+        lpips_fn = lpips.LPIPS(net="alex").to(device)
+        print("ok")
+    else:
+        lpips_fn = None
 
     baseline_rows = []
     baseline_results: dict[str, dict] = {}
-    for name, model in models.items():
-        logits, labels, video_ids = evaluate(model, loader, device)
-        acc, auc = compute_metrics(logits, labels)
-        preds = logits.argmax(1).numpy()
-        probs = torch.softmax(logits, dim=1)[:, 1].numpy()
-        r_acc, f_acc = class_acc(preds, labels.numpy())
-        v_auc = video_level_auc(probs, labels.numpy(), video_ids)
-        baseline_results[name] = {
-            "logits": logits,
-            "labels": labels,
-            "preds": preds,
-            "video_ids": video_ids,
-        }
-        baseline_rows.append(
-            {
-                "model": name,
-                "ACC": acc,
-                "real_ACC": r_acc,
-                "fake_ACC": f_acc,
-                "AUC": auc,
-                "video_AUC": v_auc,
+    if run & {"baseline", "transfer"}:
+        for name, model in models.items():
+            logits, labels, video_ids = evaluate(model, loader, device)
+            acc, auc = compute_metrics(logits, labels)
+            preds = logits.argmax(1).numpy()
+            probs = torch.softmax(logits, dim=1)[:, 1].numpy()
+            r_acc, f_acc = class_acc(preds, labels.numpy())
+            v_auc = video_level_auc(probs, labels.numpy(), video_ids)
+            baseline_results[name] = {
+                "logits": logits,
+                "labels": labels,
+                "preds": preds,
+                "video_ids": video_ids,
             }
-        )
-    print_table(baseline_rows, "Baseline (clean)")
-
-    cw_loader = make_loader(args.cw_samples)
-    if args.cw_samples is not None and args.cw_samples < len(dataset):
-        print(f"C&W capped at {args.cw_samples} frames")
+            baseline_rows.append(
+                {
+                    "model": name,
+                    "ACC": acc,
+                    "real_ACC": r_acc,
+                    "fake_ACC": f_acc,
+                    "AUC": auc,
+                    "video_AUC": v_auc,
+                }
+            )
+        print_table(baseline_rows, "Baseline (clean)")
 
     wb_rows = []
-    for name, model in models.items():
-        cheap_attacks = [
-            ("Random-0.1", RandomNoise(eps=0.1 / 255)),
-            ("FGSM-0.05", make_attack(torchattacks.FGSM(model, eps=0.05 / 255))),
-            ("FGSM-0.1", make_attack(torchattacks.FGSM(model, eps=0.1 / 255))),
-            ("FGSM-2", make_attack(torchattacks.FGSM(model, eps=2 / 255))),
-            ("FGSM-8", make_attack(torchattacks.FGSM(model, eps=8 / 255))),
-            (
-                "PGD-50",
-                make_attack(
-                    torchattacks.PGD(model, eps=8 / 255, alpha=2 / 255, steps=50)
+    if "whitebox" in run:
+        for name, model in models.items():
+            cheap_attacks = [
+                ("Random-0.1", RandomNoise(eps=0.1 / 255)),
+                ("FGSM-0.05", make_attack(torchattacks.FGSM(model, eps=0.05 / 255))),
+                ("FGSM-0.1", make_attack(torchattacks.FGSM(model, eps=0.1 / 255))),
+                ("FGSM-2", make_attack(torchattacks.FGSM(model, eps=2 / 255))),
+                ("FGSM-8", make_attack(torchattacks.FGSM(model, eps=8 / 255))),
+                (
+                    "PGD-50",
+                    make_attack(
+                        torchattacks.PGD(model, eps=8 / 255, alpha=2 / 255, steps=50)
+                    ),
                 ),
-            ),
-        ]
+            ]
+            for atk_name, attack in cheap_attacks:
+                print(f"  {name} / {atk_name} ...", end=" ", flush=True)
+                adv_logits, cp, adv_labels, vid_ids, perturb = evaluate_on_adversarial(
+                    model, attack, loader, device, lpips_fn
+                )
+                row = _attack_row(
+                    name, atk_name, adv_logits, cp, adv_labels, vid_ids, perturb
+                )
+                wb_rows.append(row)
+                print(
+                    f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
+                    f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
+                )
 
-        for atk_name, attack in cheap_attacks:
-            print(f"  {name} / {atk_name} ...", end=" ", flush=True)
-            adv_logits, cp, adv_labels, vid_ids, perturb = evaluate_on_adversarial(
-                model, attack, loader, device, lpips_fn
+    if "cw" in run:
+        cw_loader = make_loader(args.cw_samples)
+        if args.cw_samples is not None and args.cw_samples < len(dataset):
+            print(f"C&W capped at {args.cw_samples} frames")
+        for name, model in models.items():
+            print(f"  {name} / CW-L2 ...", end=" ", flush=True)
+            cw_attack = make_attack(torchattacks.CW(model, c=1.0, steps=args.cw_steps))
+            cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb = evaluate_on_adversarial(
+                model, cw_attack, cw_loader, device, lpips_fn
             )
             row = _attack_row(
-                name, atk_name, adv_logits, cp, adv_labels, vid_ids, perturb
+                name, "CW-L2", cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb
             )
             wb_rows.append(row)
             print(
@@ -269,88 +309,33 @@ def main():
                 f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
             )
 
-        print(f"  {name} / CW-L2 ...", end=" ", flush=True)
-        cw_attack = make_attack(torchattacks.CW(model, c=1.0, steps=args.cw_steps))
-        cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb = evaluate_on_adversarial(
-            model, cw_attack, cw_loader, device, lpips_fn
-        )
-        row = _attack_row(
-            name, "CW-L2", cw_logits, cw_cp, cw_labels, cw_vids, cw_perturb
-        )
-        wb_rows.append(row)
-        print(
-            f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
-            f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
-        )
-
-    print_table(wb_rows, "White-box attacks")
-
-    square_loader = make_loader(args.square_samples)
-    if args.square_samples is not None and args.square_samples < len(dataset):
-        print(f"Square Attack capped at {args.square_samples} frames")
+    if wb_rows:
+        print_table(wb_rows, "White-box attacks")
 
     bb_rows = []
-    for name, model in models.items():
-        print(f"  {name} / Square ...", end=" ", flush=True)
-        sq_attack = make_attack(
-            torchattacks.Square(
-                model, norm="Linf", eps=8 / 255, n_queries=5000, p_init=0.05
+    if "square" in run:
+        square_loader = make_loader(args.square_samples)
+        if args.square_samples is not None and args.square_samples < len(dataset):
+            print(f"Square Attack capped at {args.square_samples} frames")
+        for name, model in models.items():
+            print(f"  {name} / Square ...", end=" ", flush=True)
+            sq_attack = make_attack(
+                torchattacks.Square(
+                    model, norm="Linf", eps=8 / 255, n_queries=5000, p_init=0.05
+                )
             )
-        )
-        adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb = evaluate_on_adversarial(
-            model, sq_attack, square_loader, device, lpips_fn
-        )
-        row = _attack_row(
-            name, "Square", adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb
-        )
-        bb_rows.append(row)
-        print(
-            f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
-            f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
-        )
-
-    print_table(bb_rows, "Black-box: Square Attack (ε=8/255)")
-
-    print("\nBuilding transfer adversarial examples (PGD-50) ...")
-    transfer_asr: dict[str, dict[str, float]] = defaultdict(dict)
-    transfer_v_auc: dict[str, dict[str, float]] = defaultdict(dict)
-
-    for src_name, src_model in models.items():
-        print(f"  Generating from {src_name} ...", end=" ", flush=True)
-        attack = make_attack(
-            torchattacks.PGD(src_model, eps=8 / 255, alpha=2 / 255, steps=50)
-        )
-
-        adv_batches: list[torch.Tensor] = []
-        label_batches: list[torch.Tensor] = []
-        for images, labels, _ in loader:
-            images = images.to(device)
-            labels_d = labels.to(device)
-            adv_images = images.clone()
-            fake_mask = labels_d == 1
-            if fake_mask.any():
-                adv_images[fake_mask] = attack(images[fake_mask], labels_d[fake_mask])
-            adv_batches.append(adv_images.cpu())
-            label_batches.append(labels)
-        all_labels = torch.cat(label_batches).numpy()
-        print("done")
-
-        for tgt_name, tgt_model in models.items():
-            adv_logits_list = []
-            for adv_batch in adv_batches:
-                with torch.no_grad():
-                    adv_logits_list.append(tgt_model(adv_batch.to(device)).cpu())
-            adv_logits_all = torch.cat(adv_logits_list)
-            tgt_clean_preds = baseline_results[tgt_name]["preds"]
-            tgt_vid_ids = baseline_results[tgt_name]["video_ids"]
-            asr = attack_success_rate(
-                tgt_clean_preds, adv_logits_all.argmax(1).numpy(), all_labels
+            adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb = evaluate_on_adversarial(
+                model, sq_attack, square_loader, device, lpips_fn
             )
-            v_auc = video_level_auc(
-                torch.softmax(adv_logits_all, 1)[:, 1].numpy(), all_labels, tgt_vid_ids
+            row = _attack_row(
+                name, "Square", adv_logits, sq_cp, sq_labels, sq_vids, sq_perturb
             )
-            transfer_asr[src_name][tgt_name] = asr
-            transfer_v_auc[src_name][tgt_name] = v_auc
+            bb_rows.append(row)
+            print(
+                f"ACC={row['ACC']:.4f}  AUC={row['AUC']:.4f}  "
+                f"ASR={row['ASR']:.4f}  PSNR={row['PSNR']:.1f}"
+            )
+        print_table(bb_rows, "Black-box: Square Attack (ε=8/255)")
 
     model_names = list(models.keys())
 
@@ -363,8 +348,53 @@ def main():
             vals = "  ".join(f"{matrix[src][tgt]:>10.4f}" for tgt in model_names)
             print(f"{src:<9}{vals}")
 
-    _print_matrix(transfer_asr, "Transfer ASR matrix")
-    _print_matrix(transfer_v_auc, "Transfer video-AUC matrix")
+    transfer_asr: dict[str, dict[str, float]] = defaultdict(dict)
+    transfer_v_auc: dict[str, dict[str, float]] = defaultdict(dict)
+    if "transfer" in run:
+        print("\nBuilding transfer adversarial examples (PGD-50) ...")
+        for src_name, src_model in models.items():
+            print(f"  Generating from {src_name} ...", end=" ", flush=True)
+            attack = make_attack(
+                torchattacks.PGD(src_model, eps=8 / 255, alpha=2 / 255, steps=50)
+            )
+
+            adv_batches: list[torch.Tensor] = []
+            label_batches: list[torch.Tensor] = []
+            for images, labels, _ in loader:
+                images = images.to(device)
+                labels_d = labels.to(device)
+                adv_images = images.clone()
+                fake_mask = labels_d == 1
+                if fake_mask.any():
+                    adv_images[fake_mask] = attack(
+                        images[fake_mask], labels_d[fake_mask]
+                    )
+                adv_batches.append(adv_images.cpu())
+                label_batches.append(labels)
+            all_labels = torch.cat(label_batches).numpy()
+            print("done")
+
+            for tgt_name, tgt_model in models.items():
+                adv_logits_list = []
+                for adv_batch in adv_batches:
+                    with torch.no_grad():
+                        adv_logits_list.append(tgt_model(adv_batch.to(device)).cpu())
+                adv_logits_all = torch.cat(adv_logits_list)
+                tgt_clean_preds = baseline_results[tgt_name]["preds"]
+                tgt_vid_ids = baseline_results[tgt_name]["video_ids"]
+                asr = attack_success_rate(
+                    tgt_clean_preds, adv_logits_all.argmax(1).numpy(), all_labels
+                )
+                v_auc = video_level_auc(
+                    torch.softmax(adv_logits_all, 1)[:, 1].numpy(),
+                    all_labels,
+                    tgt_vid_ids,
+                )
+                transfer_asr[src_name][tgt_name] = asr
+                transfer_v_auc[src_name][tgt_name] = v_auc
+
+        _print_matrix(transfer_asr, "Transfer ASR matrix")
+        _print_matrix(transfer_v_auc, "Transfer video-AUC matrix")
 
     out_dir = Path(args.output_dir)
 
