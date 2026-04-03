@@ -28,9 +28,6 @@ from timm.models import xception as timm_xception
 
 from .xception import Xception, SeparableConv2d, Block
 
-
-# ── Encoder params for the Recce model ──────────────────────────────────────
-
 encoder_params = {
     "xception": {
         "features": 2048,
@@ -38,9 +35,6 @@ encoder_params = {
         "init_op": partial(timm_xception, pretrained=False),
     }
 }
-
-
-# ── Attention and reasoning modules ─────────────────────────────────────────
 
 
 class GuidedAttention(nn.Module):
@@ -227,7 +221,6 @@ class Recce(nn.Module):
 
     def features(self, x):
         self.loss_inputs = dict(recons=[], contra=[])
-        # White noise only during training
         noise_x = self.add_white_noise(x) if self.training else x
 
         out = self.encoder.conv1(noise_x)
@@ -296,9 +289,6 @@ class Recce(nn.Module):
     def forward(self, x):
         embedding = self.features(x)
         return self.classifier(embedding)
-
-
-# ── RECCE Detector ───────────────────────────────────────────────────────────
 
 
 class RecceDetector(nn.Module):

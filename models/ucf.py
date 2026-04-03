@@ -22,9 +22,6 @@ import torch.nn.functional as F
 from .xception import Xception
 
 
-# ── Helper modules ──────────────────────────────────────────────────────────
-
-
 def r_double_conv(in_channels, out_channels):
     return nn.Sequential(
         nn.Conv2d(in_channels, out_channels, 3, padding=1),

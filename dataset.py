@@ -47,10 +47,10 @@ class CelebDFv2Dataset(Dataset):
                 # List_of_testing_videos.txt: 1=real, 0=fake
                 # Model convention (deepfakebench): 0=real, 1=fake
                 label = 1 - int(parts[0])
-                video_rel = parts[1]  # e.g. "Celeb-real/id0_0000.mp4"
+                video_rel = parts[1]
                 video_path = Path(video_rel)
-                category = video_path.parent.name  # "Celeb-real"
-                video_stem = video_path.stem  # "id0_0000"
+                category = video_path.parent.name
+                video_stem = video_path.stem
                 video_id = f"{category}/{video_stem}"
 
                 frames_dir = data_dir / category / "frames" / video_stem
